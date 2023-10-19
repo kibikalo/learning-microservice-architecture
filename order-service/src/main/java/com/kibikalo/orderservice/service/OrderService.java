@@ -6,6 +6,8 @@ import com.kibikalo.orderservice.DTO.OrderRequest;
 import com.kibikalo.orderservice.model.Order;
 import com.kibikalo.orderservice.model.OrderLineItems;
 import com.kibikalo.orderservice.repository.OrderRepository;
+import io.micrometer.tracing.Span;
+import io.micrometer.tracing.Tracer;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -22,6 +24,7 @@ public class  OrderService {
 
     private final OrderRepository orderRepository;
     private final WebClient.Builder webClientBuilder;
+    private final Tracer tracer;
 
     public String placeOrder(OrderRequest orderRequest) {
         Order order = new Order();
@@ -38,21 +41,28 @@ public class  OrderService {
                 .map(OrderLineItems::getSkuCode)
                 .toList();
 
+        Span inventoryServiceLookup = tracer.currentSpan().name("InventoryServiceLookup");
 
-        // Call Inventory Service, and place order if product is in stock
-        InventoryResponse[] inventoryResponseArray = webClientBuilder.build().get()
-                .uri("http://inventory-service/api/inventory", uriBuilder -> uriBuilder.queryParam("skuCode", skuCodes).build())
-                .retrieve()
-                .bodyToMono(InventoryResponse[].class)
-                .block();
+        try(Tracer.SpanInScope spanInScope = tracer.withSpan(inventoryServiceLookup.start())) {
+            // Call Inventory Service, and place order if product is in stock
+            InventoryResponse[] inventoryResponseArray = webClientBuilder.build().get()
+                    .uri("http://inventory-service/api/inventory", uriBuilder -> uriBuilder.queryParam("skuCode", skuCodes).build())
+                    .retrieve()
+                    .bodyToMono(InventoryResponse[].class)
+                    .block();
 
-        boolean allProductsInStock = Arrays.stream(inventoryResponseArray).allMatch(InventoryResponse::isInStock);
+            boolean allProductsInStock = Arrays.stream(inventoryResponseArray).allMatch(InventoryResponse::isInStock);
 
-        if(allProductsInStock) {
-            orderRepository.save(order);
-        } else {
-            throw new IllegalArgumentException("Product is not in stock");
+            if(allProductsInStock) {
+                orderRepository.save(order);
+            } else {
+                throw new IllegalArgumentException("Product is not in stock");
+            }
+        } finally {
+            inventoryServiceLookup.end();
         }
+
+
         return "Order Placed Successfully";
     }
 
